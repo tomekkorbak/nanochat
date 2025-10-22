@@ -1,3 +1,5 @@
+set -e
+
 hf download karpathy/nanochat-d32
 mkdir -p ~/.cache/nanochat/tokenizer/
 mkdir -p ~/.cache/nanochat/chatsft_checkpoints/d32
