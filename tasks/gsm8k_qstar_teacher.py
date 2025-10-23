@@ -46,3 +46,9 @@ class GSM8KQStarTeacher(GSM8K):
             "messages": messages,
         }
         return conversation
+
+    def reward(self, conversation, assistant_response):
+        # TODO: add penalty for bad format and only discard <think> content
+        is_correct = self.evaluate(conversation, assistant_response)
+        is_correct_float = float(is_correct)
+        return is_correct_float

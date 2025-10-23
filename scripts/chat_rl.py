@@ -29,8 +29,8 @@ from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
 
 # RL hyperparameters
-run = "dummy" # wandb run name
-source = "sft" # mid|sft
+run = "rl_qstar_7k" # wandb run name
+source = "sft_qstar" # mid|sft
 dtype = "bfloat16"
 device_batch_size = 8 # no forward pass will go above this to not OOM
 examples_per_step = 16 # in total and across all ranks (note: examples, not samples/completions!)
@@ -62,6 +62,16 @@ autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=dtype)
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=run, config=user_config)
+
+# A single persistent table for evaluation samples across all eval steps (master process only)
+eval_samples_table = None
+def get_eval_samples_table():
+    global eval_samples_table
+    if eval_samples_table is None and not use_dummy_wandb:
+        eval_samples_table = wandb.Table(columns=[
+            "step", "example_idx", "prompt", "completion", "is_correct"
+        ])
+    return eval_samples_table
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model(source, device, phase="eval")
@@ -157,6 +167,11 @@ def run_gsm8k_eval(task, tokenizer, engine,
     max_examples = min(max_examples, len(task)) if max_examples is not None else len(task)
     for idx in range(ddp_rank, max_examples, ddp_world_size):
         conversation = task[idx]
+        # Extract prompt text for logging
+        try:
+            prompt_text = conversation["messages"][0]["content"]
+        except Exception:
+            prompt_text = ""
         tokens = tokenizer.render_for_completion(conversation)
         prefix_length = len(tokens)
         # Generate k samples using batched generation inside the Engine
@@ -170,9 +185,11 @@ def run_gsm8k_eval(task, tokenizer, engine,
         )
         # Check each sample for correctness
         outcomes = []
+        completions = []
         for sample_tokens in generated_token_sequences:
             generated_tokens = sample_tokens[prefix_length:]
             generated_text = tokenizer.decode(generated_tokens)
+            completions.append(generated_text)
             is_correct = task.evaluate(conversation, generated_text)
             outcomes.append({
                 "is_correct": is_correct
@@ -180,6 +197,8 @@ def run_gsm8k_eval(task, tokenizer, engine,
         # A bit bloated because I wanted to do more complex logging at one point.
         record = {
             "idx": idx,
+            "prompt": prompt_text,
+            "completions": completions,
             "outcomes": outcomes,
         }
         yield record
@@ -237,6 +256,20 @@ for step in range(num_steps):
             "step": step,
             **log_passk,
         })
+
+        # Append evaluation samples to a single persistent table and log it (master process only)
+        if not use_dummy_wandb:
+            table = get_eval_samples_table()
+            if table is not None:
+                for r in records:
+                    completions = r.get("completions", [])
+                    for comp_text, outcome in zip(completions, r["outcomes"]):
+                        table.add_data(step, r["idx"], r.get("prompt", ""), comp_text, outcome.get("is_correct", False))
+                # Log the same table name every time so it updates instead of creating new ones
+                wandb_run.log({
+                    "eval/gsm8k_samples": table,
+                    "step": step,
+                })
 
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
@@ -308,7 +341,7 @@ for step in range(num_steps):
         base_dir = get_base_dir()
         depth = model.config.n_layer
         model_tag = f"d{depth}" # base the model tag on the depth of the base model
-        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", model_tag)
+        checkpoint_dir = os.path.join(base_dir, "chatrl_qstar_checkpoints", model_tag)
         model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
         save_checkpoint(
             checkpoint_dir,
