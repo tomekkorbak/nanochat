@@ -330,6 +330,11 @@ class RustBPETokenizer:
                             add_tokens(output_start, 0)
                             add_tokens(value_ids, 0)
                             add_tokens(output_end, 0)
+                        elif part["type"] == "reasoning":
+                            # reasoning => add the tokens inside <think> and </think>
+                            add_tokens(self.encode("<think>"), 1)
+                            add_tokens(value_ids, 1)
+                            add_tokens(self.encode("</think>"), 1)
                         else:
                             raise ValueError(f"Unknown part type: {part['type']}")
                 else:
