@@ -16,6 +16,7 @@ Notice that GSM8K uses tool calls inside << >> tags.
 
 import re
 from datasets import load_dataset
+from nanochat.qstar import strip_thinking
 from tasks.common import Task
 
 
@@ -102,7 +103,7 @@ class GSM8K(Task):
         last_text_part = assistant_message['content'][-1]['text'] # this contains the final answer in GSM8K
         # Extract both the ground truth answer and the predicted answer
         ref_num = extract_answer(last_text_part)
-        pred_num = extract_answer(assistant_response)
+        pred_num = extract_answer(strip_thinking(assistant_response))
         # Compare and return the success as int
         is_correct = int(pred_num == ref_num)
         return is_correct

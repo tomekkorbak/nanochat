@@ -1,37 +1,37 @@
 # %%
 
-import re
-
 def strip_thinking(text: str) -> str:
     """
     1. If there are not <think> tags, return string as is.
     2. If there are well-formed <think>[content]</think> tag pairs, remove these tags and their contents.
     3. If there are unclosed <think> tags, remove them and what follows them.
     """
-    if "</think>" not in text:
-        return ""
+    open_tag = "<think>"
+    close_tag = "</think>"
 
-    # Find all <think> tags
-    think_tags = re.findall(r'<think>.*?</think>', text)
+    result_parts: list[str] = []
+    scan_index = 0
 
-    # If the tag is not closed, remove the tag and what follows it
-    breakpoint()
-    if think_tags:
+    while True:
+        start = text.find(open_tag, scan_index)
+        if start == -1:
+            # No more opening tags; append the rest and finish
+            result_parts.append(text[scan_index:])
+            break
 
-        text = think_tags[0]
+        # Append content before the tag
+        result_parts.append(text[scan_index:start])
 
+        # Find the corresponding closing tag
+        end = text.find(close_tag, start + len(open_tag))
+        if end == -1:
+            # Unclosed tag: drop everything from the opening tag onward
+            break
 
-    # INSERT_YOUR_CODE
-    idx = text.find("<think>")
-    if idx != -1:
-        return ""
+        # Skip the entire <think>...</think> segment
+        scan_index = end + len(close_tag)
 
-    return text
+    return "".join(result_parts)
 
-print(strip_thinking("<think>hello world</think>")) # ""
-
-print(strip_thinking("<think>hello world</think> th")) # " th"
-print(strip_thinking("<think>hello world</think> then this was th</think>hello world")) # "then this was th</think>hello world"
-print(strip_thinking("<think>hello world")) # ""
 
 

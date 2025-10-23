@@ -19,6 +19,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import os
 import itertools
 import re
+import time
 import wandb
 import torch
 import torch.distributed as dist
@@ -35,7 +36,7 @@ dtype = "bfloat16"
 device_batch_size = 8 # no forward pass will go above this to not OOM
 examples_per_step = 16 # in total and across all ranks (note: examples, not samples/completions!)
 num_samples = 16 # number of samples per example (/question)
-max_new_tokens = 256
+max_new_tokens = 512
 temperature = 1.0
 top_k = 50 # TODO: try None?
 unembedding_lr = 0.004
@@ -104,6 +105,7 @@ def get_batch():
         generated_token_sequences = []
         masks = []
         num_sampling_steps = num_samples // device_batch_size # go sequentially to prevent OOMs
+        t_sampling_start = time.time()
         for sampling_step in range(num_sampling_steps):
             seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
             with autocast_ctx:
@@ -117,8 +119,10 @@ def get_batch():
                 )
             generated_token_sequences.extend(generated_token_sequences_batch)
             masks.extend(masks_batch)
+        sampling_time_s = time.time() - t_sampling_start
 
         # Calculate the rewards for each sample
+        t_reward_start = time.time()
         rewards = []
         for sample_tokens in generated_token_sequences:
             # Get just the generated tokens (after the prompt)
@@ -128,6 +132,7 @@ def get_batch():
             # Calculate the reward
             reward = train_task.reward(conversation, generated_text)
             rewards.append(reward)
+        reward_time_s = time.time() - t_reward_start
 
         # Pad the sequences so that their lengths (in time) match
         max_length = max(len(seq) for seq in generated_token_sequences)
@@ -146,15 +151,15 @@ def get_batch():
         # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
         mu = rewards.mean()
         advantages = rewards - mu
-        # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
-        yield generated_token_sequences, inputs, targets, rewards, advantages
+        # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats along with timing
+        yield generated_token_sequences, inputs, targets, rewards, advantages, sampling_time_s, reward_time_s
 
 # -----------------------------------------------------------------------------
 # Simple evaluation loop for GSM8K pass@k
 def run_gsm8k_eval(task, tokenizer, engine,
     max_examples=None,
     num_samples=1,
-    max_completion_tokens=256,
+    max_completion_tokens=max_new_tokens,
     temperature=0.0,
     top_k=50
 ):
@@ -274,9 +279,17 @@ for step in range(num_steps):
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
+    # timing accumulators for this step (seconds)
+    step_sampling_time_s = 0.0
+    step_reward_time_s = 0.0
+    step_logprob_time_s = 0.0
+    step_backward_time_s = 0.0
+    step_optim_time_s = 0.0
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
-        sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
+        sequences_all, inputs_all, targets_all, rewards_all, advantages_all, sampling_time_s, reward_time_s = next(batch_iterator)
+        step_sampling_time_s += sampling_time_s
+        step_reward_time_s += reward_time_s
         # Evaluate the loss and gradients
         model.train() # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
@@ -290,8 +303,10 @@ for step in range(num_steps):
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
             # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
+            t_forward_start = time.time()
             with autocast_ctx:
                 logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)
+            step_logprob_time_s += time.time() - t_forward_start
             # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
             # normalize by the number of valid tokens, number of passes, and examples_per_rank
@@ -300,7 +315,9 @@ for step in range(num_steps):
             # Note, there is no need to add PPO ratio+clip because we are on policy
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
+            t_backward_start = time.time()
             loss.backward()
+            step_backward_time_s += time.time() - t_backward_start
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
         # For logging
         rewards_list.append(rewards_all.mean().item())
@@ -328,12 +345,35 @@ for step in range(num_steps):
     for opt in optimizers: # first set the learning rate
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
+    t_optim_start = time.time()
     for opt in optimizers: # then step the optimizers
         opt.step()
     model.zero_grad(set_to_none=True)
+    step_optim_time_s += time.time() - t_optim_start
     wandb_run.log({
         "step": step,
         "lrm": lrm,
+    })
+
+    # Aggregate and log timing metrics (average across ranks if DDP)
+    non_sampling_time_s = step_reward_time_s + step_logprob_time_s + step_backward_time_s + step_optim_time_s
+    if ddp:
+        t_sampling = torch.tensor(step_sampling_time_s, dtype=torch.float, device=device)
+        t_non_sampling = torch.tensor(non_sampling_time_s, dtype=torch.float, device=device)
+        dist.all_reduce(t_sampling, op=dist.ReduceOp.AVG)
+        dist.all_reduce(t_non_sampling, op=dist.ReduceOp.AVG)
+        step_sampling_time_s = t_sampling.item()
+        non_sampling_time_s = t_non_sampling.item()
+
+    step_total_time_s = step_sampling_time_s + non_sampling_time_s
+    print0(
+        f"Step {step}/{num_steps} | time(s): sampling={step_sampling_time_s:.3f} | non_sampling={non_sampling_time_s:.3f} | total={step_total_time_s:.3f}"
+    )
+    wandb_run.log({
+        "step": step,
+        "time/sampling_s": step_sampling_time_s,
+        "time/non_sampling_s": non_sampling_time_s,
+        "time/step_total_s": step_total_time_s,
     })
 
     # Master process saves the model once in a while. Skip first step. Save last step.
